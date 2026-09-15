@@ -56,8 +56,8 @@ class _HomePageState extends State<HomePage> {
     // STATUS updates continuously.
     // PHOTO does NOT update continuously.
     statusTimer = Timer.periodic(
-      const Duration(milliseconds: 700),
-      (_) => readStatus(),
+      const Duration(milliseconds: 400),
+      (_) => readLocalStatus(),
     );
 
     _initialLoad();
@@ -69,19 +69,53 @@ class _HomePageState extends State<HomePage> {
     super.dispose();
   }
 
-  Future<void> sendCommand(String command, String value) async {
+  Future<void> sendDirectCommand(String path) async {
+    if (esp32Ip.isEmpty) {
+      await readStatus();
+    }
+    if (esp32Ip.isEmpty) {
+      debugPrint('DIRECT COMMAND: ESP32 IP unavailable');
+      return;
+    }
     try {
-      final response = await http.put(
-        Uri.parse('$firebaseUrl/commands.json'),
-        headers: {'Content-Type': 'application/json'},
-        body: jsonEncode({command: value}),
+      final uri = Uri.parse(
+        'http://$esp32Ip/$path?t=${DateTime.now().millisecondsSinceEpoch}',
       );
-
-      if (response.statusCode < 200 || response.statusCode >= 300) {
-        debugPrint('Command failed: HTTP ${response.statusCode}');
-      }
+      final response = await http
+          .get(uri)
+          .timeout(const Duration(milliseconds: 500));
+      debugPrint('DIRECT COMMAND $path -> HTTP ${response.statusCode}');
     } catch (e) {
-      debugPrint('Command error: $e');
+      debugPrint('DIRECT COMMAND $path error: $e');
+    }
+  }
+
+  Future<void> readLocalStatus() async {
+    if (esp32Ip.isEmpty) {
+      await readStatus();
+      return;
+    }
+    try {
+      final response = await http
+          .get(Uri.parse(
+              'http://$esp32Ip/status?t=${DateTime.now().millisecondsSinceEpoch}'))
+          .timeout(const Duration(milliseconds: 350));
+      if (response.statusCode != 200) return;
+      final data = jsonDecode(response.body);
+      if (data is! Map || !mounted) return;
+      setState(() {
+        esp32Online = true;
+        personDetected = data['present'] == true;
+        screenOn = data['screen_state']?.toString().toUpperCase() == 'ON';
+        flashStatus = (data['flash'] == true ||
+                data['flash']?.toString().toUpperCase() == 'ON')
+            ? 'ON'
+            : 'OFF';
+        rssi = int.tryParse(data['rssi']?.toString() ?? '') ?? rssi;
+      });
+    } catch (e) {
+      if (mounted) setState(() => esp32Online = false);
+      debugPrint('Local status error: $e');
     }
   }
 
@@ -126,69 +160,40 @@ class _HomePageState extends State<HomePage> {
     if (mounted) setState(() {});
 
     try {
-      // Read the current Firebase photo timestamp first.
-      int oldTimestamp = 0;
-      try {
-        final oldResponse = await http
-            .get(Uri.parse('$firebaseUrl/photo.json'))
-            .timeout(const Duration(seconds: 4));
-        if (oldResponse.statusCode == 200 && oldResponse.body != 'null') {
-          final oldData = jsonDecode(oldResponse.body);
-          if (oldData is Map) {
-            oldTimestamp = int.tryParse(
-                    oldData['timestamp']?.toString() ?? '') ??
-                0;
-          }
-        }
-      } catch (e) {
-        debugPrint('PHOTO: could not read old photo: $e');
+      // Get the current ESP32 IP first. Status is still read from Firebase,
+      // but the actual JPEG travels directly over the local Wi-Fi network.
+      await readStatus();
+
+      if (esp32Ip.isEmpty) {
+        debugPrint('PHOTO: ESP32 IP is empty');
+        return;
       }
 
-      // IMPORTANT: request exactly ONE fresh photo through Firebase.
-      // ESP32 receives capture=NOW, captures, uploads photo.json,
-      // then clears /commands.json so it cannot repeat.
-      debugPrint('PHOTO: sending capture NOW to ESP32 through Firebase');
-      await sendCommand('capture', 'NOW');
+      final uri = Uri.parse(
+        'http://$esp32Ip/quick_capture?t=${DateTime.now().millisecondsSinceEpoch}',
+      );
 
-      // Wait for ESP32 to upload a NEW timestamp.
-      for (int i = 0; i < 30; i++) {
-        await Future.delayed(const Duration(milliseconds: 300));
+      debugPrint('PHOTO: DIRECT capture -> $uri');
+      final response = await http
+          .get(uri)
+          .timeout(const Duration(milliseconds: 900));
 
-        try {
-          final checkResponse = await http
-              .get(Uri.parse('$firebaseUrl/photo.json'))
-              .timeout(const Duration(seconds: 3));
-
-          if (checkResponse.statusCode != 200 ||
-              checkResponse.body == 'null') {
-            continue;
-          }
-
-          final data = jsonDecode(checkResponse.body);
-          if (data is! Map) continue;
-
-          final newTimestamp =
-              int.tryParse(data['timestamp']?.toString() ?? '') ?? 0;
-
-          if (newTimestamp != 0 && newTimestamp != oldTimestamp) {
-            final encoded = data['data']?.toString() ?? '';
-            if (encoded.isNotEmpty && mounted) {
-              setState(() {
-                photoData = encoded;
-              });
-              debugPrint(
-                  'PHOTO: NEW photo loaded, timestamp=$newTimestamp');
-            }
-            return;
-          }
-        } catch (e) {
-          debugPrint('PHOTO: waiting for new photo: $e');
+      if (response.statusCode == 200 && response.bodyBytes.isNotEmpty) {
+        if (mounted) {
+          setState(() {
+            photoData = base64Encode(response.bodyBytes);
+          });
         }
+        debugPrint(
+          'PHOTO: DIRECT OK (${response.bodyBytes.length} bytes)',
+        );
+      } else {
+        debugPrint(
+          'PHOTO: DIRECT failed HTTP ${response.statusCode}',
+        );
       }
-
-      debugPrint('PHOTO: timeout waiting for ESP32 new photo');
     } catch (e) {
-      debugPrint('PHOTO: Firebase capture error: $e');
+      debugPrint('PHOTO: DIRECT error: $e');
     } finally {
       photoBusy = false;
       if (mounted) setState(() {});
@@ -201,7 +206,7 @@ class _HomePageState extends State<HomePage> {
 
     refreshBusy = true;
     try {
-      await readStatus();
+      await readLocalStatus();
       await captureAndLoadPhoto();
     } finally {
       refreshBusy = false;
@@ -210,21 +215,40 @@ class _HomePageState extends State<HomePage> {
 
   Widget statusCard() {
     return Card(
-      child: ListTile(
-        leading: Icon(
-          Icons.circle,
-          color: esp32Online ? Colors.green : Colors.red,
-        ),
-        title: const Text(
-          'ESP32 STATUS',
-          style: TextStyle(fontWeight: FontWeight.bold),
-        ),
-        trailing: Text(
-          esp32Online ? 'ONLINE' : 'OFFLINE',
-          style: TextStyle(
-            color: esp32Online ? Colors.green : Colors.red,
-            fontWeight: FontWeight.bold,
-          ),
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 18, vertical: 14),
+        child: Row(
+          children: [
+            Icon(
+              Icons.circle,
+              size: 18,
+              color: esp32Online ? Colors.green : Colors.red,
+            ),
+            const SizedBox(width: 12),
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  const Text(
+                    'ESP32 STATUS',
+                    style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
+                  ),
+                  const SizedBox(height: 4),
+                  Text(
+                    'IP: ${esp32Ip.isEmpty ? '---' : esp32Ip}',
+                    style: const TextStyle(fontSize: 15),
+                  ),
+                ],
+              ),
+            ),
+            Text(
+              esp32Online ? 'ONLINE' : 'OFFLINE',
+              style: TextStyle(
+                color: esp32Online ? Colors.green : Colors.red,
+                fontWeight: FontWeight.bold,
+              ),
+            ),
+          ],
         ),
       ),
     );
@@ -233,37 +257,89 @@ class _HomePageState extends State<HomePage> {
   Widget servoCard() {
     return Card(
       child: Padding(
-        padding: const EdgeInsets.all(18),
+        padding: const EdgeInsets.all(14),
         child: Column(
           children: [
             const Text(
               'SERVO CONTROL',
-              style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold),
+              style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
             ),
-            const SizedBox(height: 15),
+            const SizedBox(height: 12),
             Row(
-              mainAxisAlignment: MainAxisAlignment.spaceEvenly,
               children: [
-                ElevatedButton.icon(
-                  onPressed: () {
-                    setState(() => servoOn = true);
-                    sendCommand('servo', 'ON');
-                  },
-                  icon: const Icon(Icons.power),
-                  label: const Text('ON'),
+                Expanded(
+                  child: ElevatedButton.icon(
+                    onPressed: () {
+                      setState(() => servoOn = true);
+                      sendDirectCommand('on');
+                      Future.delayed(const Duration(milliseconds: 120), () {
+                        if (mounted) setState(() => servoOn = false);
+                      });
+                    },
+                    icon: const Icon(Icons.power, size: 20),
+                    label: const Text('ON'),
+                  ),
                 ),
-                ElevatedButton.icon(
-                  onPressed: () {
-                    setState(() => servoOn = false);
-                    sendCommand('servo', 'OFF');
-                  },
-                  icon: const Icon(Icons.power_off),
-                  label: const Text('OFF'),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: ElevatedButton.icon(
+                    onPressed: () {
+                      setState(() => servoOn = false);
+                      sendDirectCommand('off');
+                    },
+                    icon: const Icon(Icons.power_off, size: 20),
+                    label: const Text('OFF'),
+                  ),
                 ),
               ],
             ),
-            const SizedBox(height: 10),
+            const SizedBox(height: 8),
             Text(servoOn ? 'Servo: ON' : 'Servo: OFF'),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget flashCard() {
+    final isOn = flashStatus.toUpperCase() == 'ON';
+    return Card(
+      child: Padding(
+        padding: const EdgeInsets.all(14),
+        child: Column(
+          children: [
+            const Text(
+              'FLASH CONTROL',
+              style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
+            ),
+            const SizedBox(height: 12),
+            Row(
+              children: [
+                Expanded(
+                  child: ElevatedButton.icon(
+                    onPressed: () {
+                      setState(() => flashStatus = 'ON');
+                      sendDirectCommand('flash_on');
+                    },
+                    icon: const Icon(Icons.flash_on, size: 20),
+                    label: const Text('ON'),
+                  ),
+                ),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: ElevatedButton.icon(
+                    onPressed: () {
+                      setState(() => flashStatus = 'OFF');
+                      sendDirectCommand('flash_off');
+                    },
+                    icon: const Icon(Icons.flash_off, size: 20),
+                    label: const Text('OFF'),
+                  ),
+                ),
+              ],
+            ),
+            const SizedBox(height: 8),
+            Text('Flash: ${isOn ? 'ON' : 'OFF'}'),
           ],
         ),
       ),
@@ -276,25 +352,37 @@ class _HomePageState extends State<HomePage> {
         children: [
           ListTile(
             leading: Icon(
-              Icons.person,
-              color: personDetected ? Colors.green : Colors.grey,
-            ),
-            title: const Text('PERSON'),
-            trailing:
-                Text(personDetected ? 'DETECTED' : 'NOT DETECTED'),
-          ),
-          ListTile(
-            leading: Icon(
               Icons.tv,
               color: screenOn ? Colors.green : Colors.grey,
             ),
-            title: const Text('SCREEN'),
-            trailing: Text(screenOn ? 'ON' : 'OFF'),
+            title: const Text(
+              'SCREEN',
+              style: TextStyle(fontSize: 18),
+            ),
+            trailing: Text(
+              screenOn ? 'ON' : 'OFF',
+              style: TextStyle(
+                color: screenOn ? Colors.green : Colors.grey,
+                fontWeight: FontWeight.bold,
+              ),
+            ),
           ),
           ListTile(
-            leading: const Icon(Icons.flash_on),
-            title: const Text('FLASH'),
-            trailing: Text(flashStatus),
+            leading: Icon(
+              Icons.person,
+              color: personDetected ? Colors.green : Colors.grey,
+            ),
+            title: const Text(
+              'PERSON',
+              style: TextStyle(fontSize: 18),
+            ),
+            trailing: Text(
+              personDetected ? 'DETECTED' : 'NOT DETECTED',
+              style: TextStyle(
+                color: personDetected ? Colors.green : Colors.grey,
+                fontWeight: FontWeight.bold,
+              ),
+            ),
           ),
         ],
       ),
@@ -309,37 +397,38 @@ class _HomePageState extends State<HomePage> {
           children: [
             const Text(
               'ESP32-CAM',
-              style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold),
+              style: TextStyle(fontSize: 22, fontWeight: FontWeight.bold),
             ),
             const SizedBox(height: 12),
-            if (photoData != null && photoData!.isNotEmpty)
-              ClipRRect(
+            Container(
+              width: double.infinity,
+              height: 300,
+              decoration: BoxDecoration(
+                color: Colors.black26,
                 borderRadius: BorderRadius.circular(12),
-                child: Image.memory(
-                  base64Decode(photoData!),
-                  width: double.infinity,
-                  height: 240,
-                  fit: BoxFit.contain,
-                  errorBuilder: (_, __, ___) => const SizedBox(
-                    height: 240,
-                    child: Center(
-                      child: Text('Image cannot be decoded'),
-                    ),
-                  ),
-                ),
-              )
-            else
-              const SizedBox(
-                height: 240,
-                child: Center(child: Text('No photo yet')),
+                border: Border.all(color: Colors.white24),
               ),
+              clipBehavior: Clip.antiAlias,
+              child: photoData != null && photoData!.isNotEmpty
+                  ? Image.memory(
+                      base64Decode(photoData!),
+                      width: double.infinity,
+                      height: double.infinity,
+                      fit: BoxFit.contain,
+                      errorBuilder: (_, __, ___) => const Center(
+                        child: Text('Image cannot be decoded'),
+                      ),
+                    )
+                  : const Center(child: Text('No photo yet')),
+            ),
             const SizedBox(height: 10),
-            Text(
-              photoBusy
-                  ? 'TAKING ONE FRESH PHOTO...'
-                  : 'Photo updates only on APP OPEN or REFRESH',
-              textAlign: TextAlign.center,
-              style: const TextStyle(fontSize: 12),
+            SizedBox(
+              width: double.infinity,
+              child: OutlinedButton.icon(
+                onPressed: photoBusy ? null : captureAndLoadPhoto,
+                icon: const Icon(Icons.refresh),
+                label: Text(photoBusy ? 'CAPTURING...' : 'REFRESH'),
+              ),
             ),
           ],
         ),
@@ -363,26 +452,36 @@ class _HomePageState extends State<HomePage> {
           physics: const AlwaysScrollableScrollPhysics(),
           padding: const EdgeInsets.all(16),
           children: [
+            // 1. IP + online status at the top
             statusCard(),
             const SizedBox(height: 12),
-            servoCard(),
+
+            // 2. Camera/photo frame directly below the IP
+            cameraCard(),
             const SizedBox(height: 12),
+
+            // 3. Servo and Flash controls side-by-side
+            Row(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Expanded(child: servoCard()),
+                const SizedBox(width: 10),
+                Expanded(child: flashCard()),
+              ],
+            ),
+            const SizedBox(height: 12),
+
+            // 4. Screen and person status below the controls
             sensorCard(),
             const SizedBox(height: 12),
+
+            // Wi-Fi signal kept below the requested status section
             Card(
               child: ListTile(
                 leading: const Icon(Icons.wifi),
                 title: const Text('Wi-Fi Signal'),
                 trailing: Text('$rssi dBm'),
               ),
-            ),
-            const SizedBox(height: 12),
-            cameraCard(),
-            const SizedBox(height: 20),
-            OutlinedButton.icon(
-              onPressed: refreshAll,
-              icon: const Icon(Icons.refresh),
-              label: const Text('REFRESH — TAKE NEW PHOTO'),
             ),
           ],
         ),
