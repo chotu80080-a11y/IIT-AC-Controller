@@ -23,9 +23,10 @@ jobs:
       - name: Create Android project
         run: flutter create --platforms=android .
 
-      - name: Add Internet permission
+      - name: Configure Android network access
         run: |
           sed -i '/<manifest /a\    <uses-permission android:name="android.permission.INTERNET"/>' android/app/src/main/AndroidManifest.xml
+          sed -i '/<application /s/<application /<application android:usesCleartextTraffic="true" /' android/app/src/main/AndroidManifest.xml
 
       - name: Get dependencies
         run: flutter pub get
